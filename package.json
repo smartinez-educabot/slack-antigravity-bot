@@ -1,0 +1,17 @@
+{
+  "name": "slack-antigravity-bot",
+  "version": "1.0.0",
+  "description": "Slack bot connected to Google Antigravity Cloud Code agent via Vercel serverless",
+  "private": true,
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "dependencies": {
+    "@slack/web-api": "^7.8.0",
+    "google-auth-library": "^9.15.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
