@@ -8,13 +8,17 @@
  *   3. Envía el mensaje al agente de Antigravity
  *   4. Postea la respuesta de vuelta en Slack
  *
- * Compatible con Vercel Free Tier (max 10s de ejecución).
+ * IMPORTANTE: Procesa el mensaje ANTES de enviar la respuesta HTTP,
+ * porque Vercel puede terminar la función después del res.send().
  */
 
 const { WebClient } = require("@slack/web-api");
 const { verifySlackSignature } = require("../../lib/slack-verify");
 const { sendMessage } = require("../../lib/antigravity");
 const { getValidAccessToken } = require("../../lib/token-manager");
+
+// Cache para evitar procesar eventos duplicados
+const processedEvents = new Set();
 
 module.exports = async function handler(req, res) {
   // Solo aceptar POST
@@ -53,6 +57,16 @@ module.exports = async function handler(req, res) {
   if (body.type === "event_callback") {
     const event = body.event;
 
+    // Deduplicar eventos (Slack puede reenviar)
+    const eventId = body.event_id || `${event.channel}-${event.ts}`;
+    if (processedEvents.has(eventId)) {
+      console.log("Duplicate event, skipping:", eventId);
+      return res.status(200).json({ ok: true });
+    }
+    processedEvents.add(eventId);
+    // Limpiar cache después de 60 segundos
+    setTimeout(() => processedEvents.delete(eventId), 60000);
+
     // Ignorar mensajes del propio bot (evitar loops)
     if (event.bot_id || event.subtype === "bot_message") {
       return res.status(200).json({ ok: true });
@@ -62,10 +76,12 @@ module.exports = async function handler(req, res) {
     const isDirectMessage = event.channel_type === "im";
     const isMention =
       event.type === "app_mention" ||
-      (event.text && event.text.includes(`<@${body.authorizations?.[0]?.user_id}>`));
+      (event.text &&
+        event.text.includes(
+          `<@${body.authorizations?.[0]?.user_id}>`
+        ));
 
     if (event.type === "message" && !isDirectMessage && !isMention) {
-      // Mensaje en canal pero sin mención → ignorar
       return res.status(200).json({ ok: true });
     }
 
@@ -73,13 +89,10 @@ module.exports = async function handler(req, res) {
       (event.type === "message" && (isDirectMessage || isMention)) ||
       event.type === "app_mention"
     ) {
-      // Responder 200 inmediatamente para que Slack no reintente
-      // Nota: En Vercel Free Tier, el procesamiento continúa después del res.send
-      // siempre que no exceda el timeout de la función.
-      res.status(200).json({ ok: true });
-
+      // ── PROCESAR ANTES DE RESPONDER ──
       try {
         await processMessage(event);
+        return res.status(200).json({ ok: true });
       } catch (err) {
         console.error("Error processing message:", err);
         // Intentar notificar al usuario del error
@@ -93,9 +106,8 @@ module.exports = async function handler(req, res) {
         } catch (_) {
           // Silenciar error secundario
         }
+        return res.status(200).json({ ok: true, error: err.message });
       }
-
-      return;
     }
   }
 
@@ -122,6 +134,8 @@ async function processMessage(event) {
     return;
   }
 
+  console.log("Processing message:", userMessage);
+
   // Indicador de "escribiendo..." (reacción)
   try {
     await slack.reactions.add({
@@ -134,25 +148,27 @@ async function processMessage(event) {
   }
 
   // Obtener token válido de Google
+  console.log("Getting valid access token...");
   const accessToken = await getValidAccessToken();
 
   // Llamar al agente de Antigravity
+  console.log("Calling Antigravity agent...");
   const { text: agentResponse } = await sendMessage({
     accessToken,
     model: process.env.ANTIGRAVITY_MODEL || "gemini-3-pro",
-    projectId:
-      process.env.ANTIGRAVITY_PROJECT_ID || "rising-fact-p41fc",
+    projectId: process.env.ANTIGRAVITY_PROJECT_ID || "rising-fact-p41fc",
     userMessage,
     systemPrompt: process.env.AGENT_SYSTEM_PROMPT || undefined,
     env: process.env.ANTIGRAVITY_ENV || "daily",
   });
+
+  console.log("Agent response received, posting to Slack...");
 
   // Enviar respuesta en Slack
   await slack.chat.postMessage({
     channel: event.channel,
     thread_ts: event.thread_ts || event.ts,
     text: agentResponse,
-    // Usar mrkdwn para formato rico
     mrkdwn: true,
   });
 
@@ -171,4 +187,6 @@ async function processMessage(event) {
   } catch (_) {
     // No es crítico
   }
+
+  console.log("Message processed successfully");
 }
